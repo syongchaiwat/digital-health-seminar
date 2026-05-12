@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (keep folder structure, ignore raw CSVs if large)
+# Remove the lines below if you want to commit the raw data
+# Analysis TAsk/**/*.csv
+# data/external/*.csv
+
+# macOS
+.DS_Store
+
+# Figures (optional — remove if you want to commit rendered figures)
+# figures/
