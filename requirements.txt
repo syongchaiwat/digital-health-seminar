@@ -5,5 +5,7 @@ seaborn
 scipy
 scikit-learn
 plotly
+statsmodels
 jupyter
 ipykernel
+holidays
