@@ -18,4 +18,4 @@ build/
 .DS_Store
 
 # Figures (optional — remove if you want to commit rendered figures)
-# figures/
+figures/
