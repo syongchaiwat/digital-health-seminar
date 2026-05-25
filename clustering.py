@@ -160,8 +160,8 @@ def fit_kshape(
 # ---------------------------------------------------------------------------
 
 def _raw_name(col: str) -> str:
-    """Strip normalisation suffixes (_z, _sc) to recover the original column name."""
-    for suffix in ('_z', '_sc'):
+    """Strip normalisation suffixes (_z, _sc, _bool) to recover the original column name."""
+    for suffix in ('_z', '_sc', '_bool'):
         if col.endswith(suffix):
             return col[: -len(suffix)]
     return col
