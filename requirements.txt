@@ -9,3 +9,4 @@ statsmodels
 jupyter
 ipykernel
 holidays
+tslearn
