@@ -101,11 +101,11 @@ def _per_day_features(
     sleep     = g[sleep_col]
     hour      = g['hour']
 
-    # Heart-rate windows (original clock hour, not shifted)
-    resting     = hr[sleep > 30]          # HR during hours with >30 min sleep (true sleep HR)
+    # Threshold masks — defined once, reused for features and binary flags
+    sleep_mask  = sleep > 30    # hours with meaningful sleep (true resting HR proxy)
+    active_mask = steps > 600   # vigorous-activity hours (75th pct during 08-20)
     day_mask    = hour.between(8, 20)
-    active_mask = steps > 600             # 75th pct of steps during hours 8-20
-
+    resting    = hr[sleep_mask]
     day_hr     = hr[day_mask].mean()
     resting_hr = resting.mean()
 
@@ -113,9 +113,9 @@ def _per_day_features(
     ncc          = np.nan
     ncc_per_step = np.nan
     active = g[active_mask]
-    if len(active) >= 2 and pd.notna(resting_hr):
-        mean_active_hr   = hr[active_mask].mean()
-        ncc              = mean_active_hr - resting_hr
+    if len(active) >= 1 and pd.notna(resting_hr):
+        mean_active_hr    = hr[active_mask].mean()
+        ncc               = mean_active_hr - resting_hr
         mean_active_steps = active[step_col].mean()
         if mean_active_steps > 0:
             ncc_per_step = ncc / mean_active_steps
@@ -156,7 +156,6 @@ def _per_day_features(
     sleep_hours_idx  = hour[night_sleep_mask & (sleep > 0)]
     sleep_onset      = float(sleep_hours_idx.min()) if len(sleep_hours_idx) > 0 else np.nan
     sleep_end        = float(sleep_hours_idx.max()) if len(sleep_hours_idx) > 0 else np.nan
-    with_sleep_hour  = int(sleep.gt(0).sum())
 
     return pd.Series({
         # Heart rate
@@ -170,6 +169,8 @@ def _per_day_features(
         'min_hr':              float(hr.min()),
         'ncc':                 ncc,
         'ncc_per_step':        ncc_per_step,
+        'no_active_hour':    int(active_mask.sum() == 0),
+        'restless_night':      int(sleep_mask.sum() == 0),
         # Activity
         'active_hours':        int(steps.gt(0).sum()),
         'sedentary_hours':     int(steps.eq(0).sum()),
@@ -180,8 +181,7 @@ def _per_day_features(
         'sleep_fragmentation':     fragmentation_count,
         'sleep_fragmentation_min': frag_min,
         'sleep_onset_hour':        sleep_onset,
-        'sleep_end_hour':      sleep_end,
-        'with_sleep_hour':       with_sleep_hour,
+        'sleep_end_hour':          sleep_end,
     })
 
 
@@ -229,7 +229,7 @@ def aggregate_to_daily(
         ``step_peak``, ``peak_steps_hour``, ``step_entropy``
 
         **Sleep**
-        ``sum_sleep_minute``, ``with_sleep_hour``,
+        ``sum_sleep_minute``,
         ``sleep_fragmentation`` (transition count),
         ``sleep_fragmentation_min`` (wakefulness minutes inside sleep episode),
         ``sleep_onset_hour``, ``sleep_end_hour``
@@ -281,14 +281,15 @@ def aggregate_to_daily(
     id_cols   = ['id', 'date', 'n_complete_days'] + clinical_cols
     step_cols = ['daily_steps', 'active_hours', 'sedentary_hours',
                  'step_peak', 'peak_steps_hour', 'step_entropy']
-    sleep_cols = ['sum_sleep_minute', 'with_sleep_hour',
+    sleep_cols = ['sum_sleep_minute',
                   'sleep_fragmentation', 'sleep_fragmentation_min',
                   'sleep_onset_hour', 'sleep_end_hour']
     hr_cols   = ['mean_hr', 'max_hr', 'min_hr',
                  'resting_hr', 'day_hr', 'day_hr_var', 'resting_hr_var',
                  'hr_day_night_delta', 'ncc', 'ncc_per_step']
+    bool_cols = ['no_active_hour', 'restless_night']
 
-    ordered = [c for c in id_cols + step_cols + sleep_cols + hr_cols
+    ordered = [c for c in id_cols + step_cols + sleep_cols + hr_cols + bool_cols
                if c in daily.columns]
     return daily[ordered]
 
@@ -298,13 +299,16 @@ def aggregate_to_daily(
 # ---------------------------------------------------------------------------
 
 # HR features normalised within-patient (individual baseline differs).
-_HR_FEATURES = ['resting_hr', 'day_hr_var', 'resting_hr_var', 'hr_day_night_delta', 'ncc', 'ncc_per_step']
+_HR_FEATURES = ['resting_hr', 'day_hr', 'day_hr_var', 'resting_hr_var', 'hr_day_night_delta', 'ncc', 'ncc_per_step']
 
 # Step / sleep features normalised globally (preserve between-patient magnitude).
 _STEP_SLEEP_FEATURES = [
     'daily_steps', 'active_hours', 'step_peak', 'step_entropy',
-    'sum_sleep_minute', 'sleep_fragmentation_min', 'with_sleep_hour',
+    'sum_sleep_minute', 'sleep_fragmentation_min',
 ]
+
+# Binary flags — included as-is (no scaling, no suffix).
+_BOOL_FEATURES = ['no_active_hour', 'restless_night']
 
 # External features added in round 2 (all global).
 _EXTERNAL_FEATURES = [
@@ -339,13 +343,17 @@ def build_daily_features(
 
     Returns
     -------
-    X : np.ndarray, shape (n_days, n_features)
-        Fully normalised feature matrix with no NaNs.
-    feature_cols : list[str]
-        Column names corresponding to each column of X.
-    meta_df : pd.DataFrame
-        Metadata rows aligned with X: ``id``, ``date``, and any of
-        ``disease_type``, ``sex``, ``age`` present in ``daily_df``.
+    pd.DataFrame
+        One row per patient-day (patients with <14 days excluded; NaN rows
+        *not* dropped — handle in the notebook as needed).  Contains metadata
+        columns (``id``, ``date``, ``disease_type`` / ``sex`` / ``age`` if
+        present), ``_z``-suffixed HR features, ``_sc``-suffixed scaled
+        step/sleep features, and ``_bool``-suffixed binary flags
+        (``no_active_hour_bool``, ``restless_night_bool``).  Extract feature
+        matrix::
+
+            feat_cols = [c for c in feat_df.columns if c.endswith(('_sc', '_z', '_bool'))]
+            X = feat_df[feat_cols].dropna().to_numpy(dtype=float)
     """
     df = daily_df.copy()
 
@@ -354,7 +362,8 @@ def build_daily_features(
         df['pollen_total'] = df['pollen_total'].fillna(0)
 
     # ── Within-patient z-score for HR features → suffix _z ───────────────────
-    # NaN can appear here when a patient has only 1 complete day (std = 0),
+    # NaN can still appear here when the derived feature itself is NaN for all
+    # of a patient's days (e.g. resting_hr always NaN → std is NaN too).
     # or when the derived feature itself is NaN (e.g. hr_per_100steps on a
     # fully sedentary day). Those rows are dropped below.
     for col in _HR_FEATURES:
@@ -367,11 +376,12 @@ def build_daily_features(
     # ── Collect feature columns (suffixed names) ──────────────────────────────
     step_sleep_cols  = [c for c in _STEP_SLEEP_FEATURES if c in df.columns]
     hr_z_cols        = [f'{c}_z' for c in _HR_FEATURES if f'{c}_z' in df.columns]
+    bool_cols        = [c for c in _BOOL_FEATURES if c in df.columns]
     ext_cols         = [c for c in _EXTERNAL_FEATURES if c in df.columns] if include_external else []
 
     keep_cols = ['id', 'date'] + [c for c in ['disease_type', 'sex', 'age'] if c in df.columns]
-    all_needed = keep_cols + step_sleep_cols + hr_z_cols + ext_cols
-    subset = df[all_needed].dropna(subset=step_sleep_cols + hr_z_cols + ext_cols)
+    all_needed = keep_cols + step_sleep_cols + hr_z_cols + bool_cols + ext_cols
+    subset = df[all_needed]
 
     # ── Global StandardScaler on step/sleep + external → suffix _sc ──────────
     subset = subset.copy()
@@ -381,11 +391,10 @@ def build_daily_features(
         scaler = StandardScaler()
         subset[sc_names] = scaler.fit_transform(subset[sc_target])
 
-    feature_cols = sc_names + hr_z_cols
-    X       = subset[feature_cols].to_numpy(dtype=np.float64)
-    meta_df = subset[keep_cols].reset_index(drop=True)
+    # ── Rename boolean columns → suffix _bool ────────────────────────────────
+    subset = subset.rename(columns={c: f'{c}_bool' for c in bool_cols})
 
-    return X, feature_cols, meta_df
+    return subset.reset_index(drop=True)
 
 
 def build_ts_tensor(
