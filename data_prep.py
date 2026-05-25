@@ -20,6 +20,8 @@ Column name conventions
   (e.g. ``temp_max``, ``precip_total``, ``pm25_mean``).
 """
 
+from typing import List
+
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -29,57 +31,56 @@ def get_complete_patient_days(
     df: pd.DataFrame,
     shift_hour: int = 6,
     complete: bool = True,
+    shifted_columns: List[str] = None,
 ) -> pd.DataFrame:
-    """Return hourly sensor rows annotated with a shifted date, optionally
-    filtered to only complete patient-days (24 valid hourly entries).
+    """Return hourly sensor rows with lagged column(s), optionally filtered to
+    complete patient-days.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Hourly sensor DataFrame with at minimum columns:
-        ``id`` (patient), ``time`` (datetime64), ``steps``, ``sleep``,
-        ``heartrate``.
+        Hourly sensor DataFrame with columns: ``id``, ``time``, ``steps``,
+        ``sleep``, ``heartrate``.
     shift_hour : int
-        Number of hours to shift the timestamp forward before assigning a
-        calendar date.  A value of 6 means that an entry recorded at
-        2021-01-02 03:00 is attributed to 2021-01-01 (shifted date), which
-        keeps a night's sleep on one logical date instead of splitting it at
-        midnight.
+        Number of hours to lag when creating shifted columns.  E.g. 6 means
+        ``shifted_sleep`` at 06:00 carries the sleep value from 00:00, so
+        the previous night's sleep stays on the same calendar day.
     complete : bool
-        If True, keep only patient-days that have exactly 24 hourly entries
-        in the shifted window (i.e., fully observed days).  If False, all
-        rows are returned with the shifted date column attached.
+        If True, keep only patient-days where every hourly row has non-null
+        values for ``steps``, ``heartrate``, and all shifted columns.
+    shifted_columns : list[str]
+        Columns to lag by ``shift_hour`` within each patient (sorted by
+        ``time``).  A ``shifted_{name}`` column is created for each.
+        Defaults to ``['sleep']``.
 
     Returns
     -------
     pd.DataFrame
-        Copy of ``df`` with two additional columns:
-
-        * ``shifted_datetime`` — original timestamp shifted forward by
-          ``shift_hour`` hours.
-        * ``shifted_date``     — calendar date derived from
-          ``shifted_datetime`` (midnight-normalised).
-
-        When ``complete=True``, only rows belonging to patient-days with
-        exactly 24 hourly entries are included.  The column
-        ``n_complete_days`` (count of complete days per patient) is also
-        added in that case.
+        Copy of ``df`` with ``shifted_{col}`` column(s) added.
+        When ``complete=True``, only rows from fully valid patient-days are
+        kept and ``n_complete_days`` (per patient) is added.
     """
-    df = df.copy()
+    if shifted_columns is None:
+        shifted_columns = ['sleep']
 
-    # Build shifted timestamp and date
-    df['shifted_datetime'] = df['time'] + pd.Timedelta(hours=shift_hour)
-    df['shifted_date']     = df['shifted_datetime'].dt.floor('D')
+    df = df.copy().sort_values(['id', 'time'])
+
+    for col in shifted_columns:
+        df[f'shifted_{col}'] = df.groupby('id')[col].shift(shift_hour)
 
     if not complete:
         return df
 
-    # Count entries per (patient, shifted_date); keep only days with 24
-    entries_per_day = df.groupby(['id', 'shifted_date']).size().rename('n_entries')
-    complete_days   = entries_per_day[entries_per_day == 24].reset_index()[['id', 'shifted_date']]
+    base_cols  = ['steps', 'sleep', 'heartrate']
+    check_cols = [f'shifted_{c}' if c in shifted_columns else c for c in base_cols]
 
-    df = df.merge(complete_days, on=['id', 'shifted_date'], how='inner')
-    df['n_complete_days'] = df.groupby('id')['shifted_date'].transform('nunique')
+    df['_date'] = df['time'].dt.normalize()
+    row_ok = df[check_cols].notna().all(axis=1)
+    day_complete = row_ok.groupby([df['id'], df['_date']]).transform('all')
+
+    df = df[day_complete].copy()
+    df['n_complete_days'] = df.groupby('id')['_date'].transform('nunique')
+    df = df.drop(columns=['_date'])
 
     return df
 
@@ -88,25 +89,36 @@ def get_complete_patient_days(
 # Daily aggregation
 # ---------------------------------------------------------------------------
 
-def _per_day_features(g: pd.DataFrame) -> pd.Series:
+def _per_day_features(
+    g: pd.DataFrame,
+    sleep_col: str = 'sleep',
+    step_col:  str = 'steps',
+    hr_col:    str = 'heartrate',
+) -> pd.Series:
     """Compute physiological summary features for one patient-day group."""
-    hr        = g['heartrate']
-    steps     = g['steps']
-    sleep     = g['sleep']
+    hr        = g[hr_col]
+    steps     = g[step_col]
+    sleep     = g[sleep_col]
     hour      = g['hour']
 
     # Heart-rate windows (original clock hour, not shifted)
-    resting   = hr[sleep > 30]          # HR during hours with >30 min sleep (true sleep HR)
-    active    = g[steps > 0]
-    day_mask  = hour.between(8, 20)
+    resting     = hr[sleep > 30]          # HR during hours with >30 min sleep (true sleep HR)
+    day_mask    = hour.between(8, 20)
+    active_mask = steps > 600             # 75th pct of steps during hours 8-20
 
-    day_hr      = hr[day_mask].mean()
-    resting_hr  = resting.mean()
+    day_hr     = hr[day_mask].mean()
+    resting_hr = resting.mean()
 
-    # Cardiac efficiency: mean HR per 100 steps during active hours
-    hr_per_100 = np.nan
-    if len(active) >= 2 and active['steps'].mean() > 0:
-        hr_per_100 = active['heartrate'].mean() / active['steps'].mean() * 100
+    # Net Cardiac Cost: extra HR demanded by vigorous activity above resting baseline
+    ncc          = np.nan
+    ncc_per_step = np.nan
+    active = g[active_mask]
+    if len(active) >= 2 and pd.notna(resting_hr):
+        mean_active_hr   = hr[active_mask].mean()
+        ncc              = mean_active_hr - resting_hr
+        mean_active_steps = active[step_col].mean()
+        if mean_active_steps > 0:
+            ncc_per_step = ncc / mean_active_steps
 
     # Step distribution features
     total_steps  = steps.sum()
@@ -152,10 +164,12 @@ def _per_day_features(g: pd.DataFrame) -> pd.Series:
         'day_hr':              float(day_hr),
         'hr_day_night_delta':  float(day_hr - resting_hr)
                                if pd.notna(day_hr) and pd.notna(resting_hr) else np.nan,
-        'hr_var':              float(hr.std()),
+        'day_hr_var':          float(hr[day_mask].std()),
+        'resting_hr_var':      float(resting.std()),
         'max_hr':              float(hr.max()),
         'min_hr':              float(hr.min()),
-        'hr_per_100steps':     hr_per_100,
+        'ncc':                 ncc,
+        'ncc_per_step':        ncc_per_step,
         # Activity
         'active_hours':        int(steps.gt(0).sum()),
         'sedentary_hours':     int(steps.eq(0).sum()),
@@ -171,24 +185,35 @@ def _per_day_features(g: pd.DataFrame) -> pd.Series:
     })
 
 
-def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_to_daily(
+    df: pd.DataFrame,
+    sleep_col: str = 'shifted_sleep',
+    step_col:  str = 'steps',
+    hr_col:    str = 'heartrate',
+) -> pd.DataFrame:
     """Aggregate hourly patient data to daily-level features.
 
     Designed to receive the output of ``get_complete_patient_days`` with
-    ``complete=True``.  Groups by ``(id, shifted_date)`` and any clinical
-    columns found in the DataFrame (``disease_type``, ``sex``, ``age``).
-
-    The ``shifted_date`` column becomes ``date`` in the output, so all days
-    are aligned to the logical day defined by ``shift_hour`` (e.g. 18:00
-    previous evening → 17:59 current evening for ``shift_hour=6``).
+    ``complete=True``.  Groups by ``(id, date)`` where ``date`` is the
+    calendar date derived from ``time``.
 
     Parameters
     ----------
     df : pd.DataFrame
         Hourly sensor DataFrame produced by ``get_complete_patient_days``.
-        Required columns: ``id``, ``time``, ``shifted_date``, ``steps``,
-        ``sleep``, ``heartrate``.  Optional clinical columns
-        ``disease_type``, ``sex``, ``age`` are carried through if present.
+        Required columns: ``id``, ``time``, ``steps``, ``heartrate``, and
+        whichever columns are named by ``sleep_col``, ``step_col``,
+        ``hr_col``.  Optional clinical columns ``disease_type``, ``sex``,
+        ``age`` are carried through if present.
+    sleep_col : str
+        Column to use for sleep aggregation.  Defaults to
+        ``'shifted_sleep'`` (the lagged column from
+        ``get_complete_patient_days``).
+    step_col : str
+        Column to use for step aggregation.  Defaults to ``'steps'``.
+    hr_col : str
+        Column to use for heart-rate aggregation.  Defaults to
+        ``'heartrate'``.
 
     Returns
     -------
@@ -210,28 +235,30 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
         ``sleep_onset_hour``, ``sleep_end_hour``
 
         **Heart rate**
-        ``mean_hr``, ``max_hr``, ``min_hr``, ``hr_var``,
-        ``resting_hr`` (mean HR during hours with >30 min sleep), ``day_hr`` (08:00–20:00),
+        ``mean_hr``, ``max_hr``, ``min_hr``,
+        ``resting_hr`` (mean HR, sleep >30 min), ``day_hr`` (08:00–20:00),
+        ``day_hr_var`` (HR std during 08:00–20:00), ``resting_hr_var`` (HR std during sleep >30 min),
         ``hr_day_night_delta`` (day_hr − resting_hr), ``hr_per_100steps``
     """
     df = df.copy()
 
-    # Ensure hour is available for within-day feature computation
+    # Derive calendar date and ensure hour is available
+    df['_date'] = df['time'].dt.normalize()
     if 'hour' not in df.columns:
         df['hour'] = df['time'].dt.hour
 
     # Determine groupby keys
     clinical_cols = [c for c in ['disease_type', 'sex', 'age'] if c in df.columns]
-    group_keys    = ['id', 'shifted_date'] + clinical_cols
+    group_keys    = ['id', '_date'] + clinical_cols
 
     # ── Core aggregations ────────────────────────────────────────────────────
     core = (
         df.groupby(group_keys, sort=False)
         .agg(
             n_complete_days  = ('n_complete_days', 'first'),
-            daily_steps      = ('steps',           'sum'),
-            sum_sleep_minute = ('sleep',           'sum'),
-            mean_hr          = ('heartrate',        'mean'),
+            daily_steps      = (step_col,          'sum'),
+            sum_sleep_minute = (sleep_col,          'sum'),
+            mean_hr          = (hr_col,             'mean'),
         )
         .reset_index()
     )
@@ -239,13 +266,16 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
     # ── Per-day physiological features ───────────────────────────────────────
     print('Computing per-day features...')
     day_feat = (
-        df.groupby(['id', 'shifted_date'], sort=False)
-        .apply(_per_day_features, include_groups=False)
+        df.groupby(['id', '_date'], sort=False)
+        .apply(
+            lambda g: _per_day_features(g, sleep_col=sleep_col, step_col=step_col, hr_col=hr_col),
+            include_groups=False,
+        )
         .reset_index()
     )
 
-    daily = core.merge(day_feat, on=['id', 'shifted_date'], how='left')
-    daily = daily.rename(columns={'shifted_date': 'date'})
+    daily = core.merge(day_feat, on=['id', '_date'], how='left')
+    daily = daily.rename(columns={'_date': 'date'})
 
     # Canonical column order
     id_cols   = ['id', 'date', 'n_complete_days'] + clinical_cols
@@ -254,9 +284,9 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
     sleep_cols = ['sum_sleep_minute', 'with_sleep_hour',
                   'sleep_fragmentation', 'sleep_fragmentation_min',
                   'sleep_onset_hour', 'sleep_end_hour']
-    hr_cols   = ['mean_hr', 'max_hr', 'min_hr', 'hr_var',
-                 'resting_hr', 'day_hr',
-                 'hr_day_night_delta', 'hr_per_100steps']
+    hr_cols   = ['mean_hr', 'max_hr', 'min_hr',
+                 'resting_hr', 'day_hr', 'day_hr_var', 'resting_hr_var',
+                 'hr_day_night_delta', 'ncc', 'ncc_per_step']
 
     ordered = [c for c in id_cols + step_cols + sleep_cols + hr_cols
                if c in daily.columns]
@@ -268,7 +298,7 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 # HR features normalised within-patient (individual baseline differs).
-_HR_FEATURES = ['resting_hr', 'hr_var', 'hr_day_night_delta', 'hr_per_100steps']
+_HR_FEATURES = ['resting_hr', 'day_hr_var', 'resting_hr_var', 'hr_day_night_delta', 'ncc', 'ncc_per_step']
 
 # Step / sleep features normalised globally (preserve between-patient magnitude).
 _STEP_SLEEP_FEATURES = [
