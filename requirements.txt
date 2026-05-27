@@ -11,3 +11,5 @@ ipykernel
 holidays
 tslearn
 shap
+lightgbm
+catboost

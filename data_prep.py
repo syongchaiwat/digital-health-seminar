@@ -248,6 +248,10 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
                    if c in df.columns]
     df['_is_complete_hour'] = df[_check_cols].notna().all(axis=1) if _check_cols else False
 
+    # Null out signal values for incomplete hours so all aggregations
+    # (core agg + _per_day_features) only draw from complete rows.
+    df.loc[~df['_is_complete_hour'], _check_cols] = np.nan
+
     # Determine groupby keys
     clinical_cols = [c for c in ['disease_type', 'sex', 'age'] if c in df.columns]
     group_keys    = ['id', '_date'] + clinical_cols
