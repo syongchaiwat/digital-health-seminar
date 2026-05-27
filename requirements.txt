@@ -10,3 +10,4 @@ jupyter
 ipykernel
 holidays
 tslearn
+shap

@@ -617,10 +617,10 @@ def load_covid(
     year: int = 2021,
     iso_code: str = 'CHE',
 ) -> pd.DataFrame:
-    """Load Switzerland COVID-19 stringency index from OWID.
+    """Load Switzerland COVID-19 indicators from OWID.
 
-    Falls back to ``url`` if ``path`` does not exist, filters to ``iso_code``
-    and ``year``, and caches the result to ``path``.
+    Falls back to ``url`` if ``path`` does not exist (or the cache is stale),
+    filters to ``iso_code`` and ``year``, and caches the result to ``path``.
 
     Parameters
     ----------
@@ -637,11 +637,18 @@ def load_covid(
     -------
     pd.DataFrame
         Columns: ``date``, ``stringency_index``,
-        ``new_cases_smoothed_per_million``
+        ``new_cases_smoothed_per_million``, ``people_vaccinated_per_hundred``,
+        ``reproduction_rate``, ``positive_rate``.
     """
+    _COLS = [
+        'date', 'stringency_index', 'new_cases_smoothed_per_million',
+        'people_vaccinated_per_hundred', 'reproduction_rate', 'positive_rate',
+    ]
     try:
         df = pd.read_csv(path, parse_dates=['date'])
-        return df
+        if all(c in df.columns for c in _COLS):
+            return df
+        # Cache is stale (missing new columns) — re-fetch below
     except FileNotFoundError:
         pass
 
@@ -649,7 +656,7 @@ def load_covid(
     df = raw[
         (raw['iso_code'] == iso_code) &
         (raw['date'].between(f'{year}-01-01', f'{year}-12-31'))
-    ][['date', 'stringency_index', 'new_cases_smoothed_per_million']].copy()
+    ][_COLS].copy()
     df['date'] = pd.to_datetime(df['date'])
     df.to_csv(path, index=False)
 
@@ -710,6 +717,55 @@ def load_pollen(
     raw['pollen_total'] = raw[['alder', 'birch', 'hazel', 'beech', 'ash', 'oak', 'grasses']].sum(axis=1)
 
     return raw.reset_index(drop=True)
+
+
+def classify_weather_day(df: pd.DataFrame) -> pd.Series:
+    """Classify each day into a descriptive weather category.
+
+    Uses a priority-based rule chain so that precipitation takes precedence
+    over sunshine, and temperature refines the sunniest category.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns ``precip_mm``, ``sunshine_min``, ``temp_c_max``
+        (as produced by ``load_weather`` with ``daily=True`` and renamed).
+
+    Returns
+    -------
+    pd.Series
+        String category per row.  One of:
+        ``'Rainy'``, ``'Drizzly'``, ``'Cloudy'``, ``'Partly cloudy'``,
+        ``'Sunny'``, ``'Hot & sunny'``.
+
+    Thresholds (tuned to Zürich 2021 distributions):
+
+    | Category      | Rule                                                |
+    |---------------|-----------------------------------------------------|
+    | Rainy         | precip_mm > 5                                       |
+    | Drizzly       | precip_mm > 1                                       |
+    | Cloudy        | sunshine_min < 120                                  |
+    | Partly cloudy | sunshine_min < 400                                  |
+    | Hot & sunny   | sunshine_min >= 400 and temp_c_max >= 25            |
+    | Sunny         | sunshine_min >= 400                                 |
+    """
+    conditions = [
+        df['precip_mm'] > 5,
+        df['precip_mm'] > 1,
+        df['sunshine_min'] < 120,
+        df['sunshine_min'] < 400,
+        (df['sunshine_min'] >= 400) & (df['temp_c_max'] >= 25),
+    ]
+    labels = ['Rainy', 'Drizzly', 'Cloudy', 'Partly cloudy', 'Hot & sunny']
+    return pd.Series(
+        pd.array(
+            [next((l for c, l in zip(conditions, labels) if c.iloc[i]), 'Sunny')
+             for i in range(len(df))],
+            dtype=object,
+        ),
+        index=df.index,
+        name='weather_type',
+    )
 
 
 def load_air_quality(
