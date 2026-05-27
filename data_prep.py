@@ -53,27 +53,36 @@ def get_complete_patient_days(
     Returns
     -------
     pd.DataFrame
-        Copy of ``df`` with ``shifted_sleep`` and ``shifted_heartrate`` added.
-        When ``complete=True``, only fully valid patient-days are kept and
-        ``n_complete_days`` (per patient) is added.
+        Copy of ``df`` with ``shifted_sleep``, ``shifted_heartrate``,
+        ``is_complete_hour`` (bool per row: all four signals non-null), and
+        ``n_complete_days`` (count of fully-complete days per patient) added.
+        When ``complete=True``, only fully-valid patient-days are kept.
     """
     df = df.copy().sort_values(['id', 'time'])
 
     df['shifted_sleep']     = df.groupby('id')['sleep'].shift(sleep_shift_hour)
     df['shifted_heartrate'] = df.groupby('id')['heartrate'].shift(sleep_shift_hour)
 
-    if not complete:
-        return df
-
     check_cols = ['steps', 'heartrate', 'shifted_sleep', 'shifted_heartrate']
 
     df['_date'] = df['time'].dt.normalize()
     row_ok = df[check_cols].notna().all(axis=1)
+
+    # Per-row flag: True when all four signals are present for this hour
+    df['is_complete_hour'] = row_ok
+
+    # Per-day flag: True only if every row in the day is complete
     day_complete = row_ok.groupby([df['id'], df['_date']]).transform('all')
 
-    df = df[day_complete].copy()
-    df['n_complete_days'] = df.groupby('id')['_date'].transform('nunique')
+    # n_complete_days: count of complete days per patient (always computed)
+    _complete_dates = df.loc[day_complete, ['id', '_date']].drop_duplicates()
+    _n_complete     = _complete_dates.groupby('id')['_date'].count().rename('n_complete_days')
+    df['n_complete_days'] = df['id'].map(_n_complete).fillna(0).astype(int)
+
     df = df.drop(columns=['_date'])
+
+    if complete:
+        df = df[day_complete].copy()
 
     return df
 
@@ -207,7 +216,8 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
         One row per ``(id, date)`` with columns:
 
         **Identity / metadata**
-        ``id``, ``date``, ``n_complete_days``,
+        ``id``, ``date``, ``n_complete_days``, ``n_complete_hours``
+        (hours in the day where all four signals are non-null),
         ``disease_type`` / ``sex`` / ``age`` (if present in input)
 
         **Steps**
@@ -233,6 +243,11 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
     if 'hour' not in df.columns:
         df['hour'] = df['time'].dt.hour
 
+    # n_complete_hours: hours per day where all four core signals are present
+    _check_cols = [c for c in ['steps', 'heartrate', 'shifted_sleep', 'shifted_heartrate']
+                   if c in df.columns]
+    df['_is_complete_hour'] = df[_check_cols].notna().all(axis=1) if _check_cols else False
+
     # Determine groupby keys
     clinical_cols = [c for c in ['disease_type', 'sex', 'age'] if c in df.columns]
     group_keys    = ['id', '_date'] + clinical_cols
@@ -241,10 +256,11 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
     core = (
         df.groupby(group_keys, sort=False)
         .agg(
-            n_complete_days  = ('n_complete_days',   'first'),
-            daily_steps      = ('steps',             'sum'),
-            sum_sleep_minute = ('shifted_sleep',     'sum'),
-            mean_hr          = ('heartrate',         'mean'),
+            n_complete_days  = ('n_complete_days',      'first'),
+            n_complete_hours = ('_is_complete_hour',    'sum'),
+            daily_steps      = ('steps',                'sum'),
+            sum_sleep_minute = ('shifted_sleep',        'sum'),
+            mean_hr          = ('heartrate',            'mean'),
         )
         .reset_index()
     )
@@ -264,7 +280,7 @@ def aggregate_to_daily(df: pd.DataFrame) -> pd.DataFrame:
     daily = daily.rename(columns={'_date': 'date'})
 
     # Canonical column order
-    id_cols   = ['id', 'date', 'n_complete_days'] + clinical_cols
+    id_cols   = ['id', 'date', 'n_complete_days', 'n_complete_hours'] + clinical_cols
     step_cols = ['daily_steps', 'active_hours', 'sedentary_hours',
                  'step_peak', 'peak_steps_hour', 'step_entropy']
     sleep_cols = ['sum_sleep_minute',
